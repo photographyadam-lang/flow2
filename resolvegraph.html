@@ -1,0 +1,1141 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Time to Resolve Graph Example</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <style>
+    :root{
+      --bg:#f3f6fb; --card:#ffffff; --muted:#6b7280; --accent:#2563eb; --accent-2:#06b6d4; --danger:#ef4444; --border:#e6eefb;
+      --radius:12px; --glass: rgba(255,255,255,0.6);
+    }
+    html,body{height:100%;}
+    body{font-family: Inter, ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial; background:var(--bg); color:#111827; margin:0; padding:20px; -webkit-font-smoothing:antialiased;}
+    .app-root{max-width:1100px; margin:20px auto;}
+    .card{background:var(--card); padding:20px; border-radius:var(--radius); box-shadow:0 6px 18px rgba(16,24,40,0.06); border:1px solid rgba(6,21,52,0.04);} 
+    h1{font-size:18px; margin:0 0 12px 0; font-weight:600; color:#0f172a}
+    .row{display:flex; gap:12px; align-items:flex-end; flex-wrap:wrap}
+    .field{min-width:220px; flex:1}
+    label{display:block; font-size:13px; color:var(--muted); margin-bottom:6px}
+    input[type=file]{display:block}
+    input[type=date], input[type=text], .field input{padding:8px 10px; border:1px solid #e6eefb; border-radius:8px; background:#fbfdff}
+    button{background:var(--accent); color:#fff; border:none; padding:8px 12px; border-radius:8px; cursor:pointer; font-weight:600}
+    button[type='button']{box-shadow:0 4px 10px rgba(37,99,235,0.12)}
+    .upload-note{font-size:12px; color:var(--muted); margin-top:6px}
+    .status-message{font-size:13px; margin-top:10px}
+    .status-message.info{color:#064e3b}
+    .status-message.error{color:var(--danger)}
+    .chart-container{margin-top:14px; border-radius:10px; background:linear-gradient(180deg,#ffffff 0%, #fbfdff 100%); border:1px solid #eef2ff; min-height:360px; padding:8px; position:relative}
+    .no-data-message{color:var(--muted); text-align:center; padding:40px 0}
+    .chart-subtext{font-size:13px; color:var(--muted)}
+    .toggles-row{display:flex; gap:8px; flex-wrap:wrap}
+    .toggle{display:inline-flex; align-items:center; gap:8px; background:#f8fafc; padding:6px 8px; border-radius:8px; font-size:13px; color:#0f172a}
+    .toggle input{accent-color:var(--accent)}
+    .debug-details{background:#fff; border:1px solid #eef2ff; padding:8px; border-radius:8px}
+    .stats-bar{font-size:13px; color:#0f172a}
+    .stats-bar div{display:inline-block; margin-right:18px}
+  .point-tooltip{position:absolute; display:none; pointer-events:none; background:rgba(15,23,42,0.9); color:#fff; padding:6px 8px; border-radius:6px; font-size:12px; box-shadow:0 6px 18px rgba(2,6,23,0.3); white-space:pre-wrap;}
+    @media (max-width:800px){ .field{min-width:160px} .card{padding:14px} }
+  </style>
+  </head>
+  <body>
+    <div id="root" class="app-root"></div>
+  <script>
+    // Run after DOM is ready so `#root` exists when the script runs (fixes white screen on file://)
+    document.addEventListener('DOMContentLoaded', function () {
+    // Self-contained plain-JS version so the file works when opened via file://
+    // Minimal reimplementation of CSV upload, parsing and a simple SVG chart.
+
+    // Utilities
+    function parseDateYMD(str) {
+      if (!str) return null;
+      const m = str.trim().match(/^(\d{4})-(\d{2})-(\d{2})$/);
+      if (!m) return null;
+      const year = parseInt(m[1], 10);
+      const month = parseInt(m[2], 10) - 1;
+      const day = parseInt(m[3], 10);
+      return new Date(year, month, day);
+    }
+
+    // More permissive date parser: tries ISO first, then common US/EU formats.
+    function parseDateFlexible(str) {
+      if (!str) return null;
+      str = String(str).trim();
+      // Try YYYY-MM-DD
+      const iso = parseDateYMD(str);
+      if (iso) return iso;
+      // Try MM/DD/YYYY or M/D/YYYY
+      let m = str.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
+      if (m) {
+        const a = parseInt(m[1],10), b = parseInt(m[2],10), y = parseInt(m[3],10);
+        // Heuristic: if first > 12 treat as day-first (DD/MM)
+        if (a > 12) return new Date(y, b-1, a);
+        return new Date(y, a-1, b);
+      }
+      // Try YYYY/MM/DD
+      m = str.match(/^(\d{4})\/(\d{1,2})\/(\d{1,2})$/);
+      if (m) return new Date(parseInt(m[1],10), parseInt(m[2],10)-1, parseInt(m[3],10));
+      // Try simple numeric timestamp
+      const n = Number(str);
+      if (!isNaN(n) && n > 1000000000) return new Date(n);
+      return null;
+    }
+
+    function normalizeToMidnight(d) {
+      if (!d) return d;
+      return new Date(d.getFullYear(), d.getMonth(), d.getDate());
+    }
+
+    function formatDateKey(date) {
+      const y = date.getFullYear();
+      const m = String(date.getMonth() + 1).padStart(2, '0');
+      const d = String(date.getDate()).padStart(2, '0');
+      return y + '-' + m + '-' + d;
+    }
+
+    function addDays(date, n) {
+      const d = new Date(date.getFullYear(), date.getMonth(), date.getDate());
+      d.setDate(d.getDate() + n);
+      return d;
+    }
+
+    function diffDays(start, end) {
+      const msPerDay = 24 * 60 * 60 * 1000;
+      const startMid = new Date(start.getFullYear(), start.getMonth(), start.getDate());
+      const endMid = new Date(end.getFullYear(), end.getMonth(), end.getDate());
+      return (endMid - startMid) / msPerDay;
+    }
+
+  function parseCsv(text) {
+      // Normalize line endings and strip UTF-8 BOM if present
+      text = text.replace(/\r\n/g, '\n').replace(/\r/g, '\n').replace(/^\uFEFF/, '');
+      const lines = text.split('\n');
+      // Find first non-empty line to be header (tolerant of leading blank lines)
+      let headerLineIndex = 0;
+      while (headerLineIndex < lines.length && lines[headerLineIndex].trim() === '') headerLineIndex++;
+      if (headerLineIndex >= lines.length) return { headerError: 'CSV file appears to be empty.', rows: [], invalidCount: 0 };
+
+      const headerLine = lines[headerLineIndex];
+
+      // Detect delimiter (prefer comma, but accept semicolon if it's used)
+      const delimiter = headerLine.indexOf(';') !== -1 && headerLine.indexOf(',') === -1 ? ';' : ',';
+
+      function splitCsvLine(line, delim) {
+        const out = [];
+        let cur = '';
+        let inQuotes = false;
+        for (let i = 0; i < line.length; i++) {
+          const ch = line[i];
+          if (ch === '"') {
+            if (inQuotes && i + 1 < line.length && line[i + 1] === '"') {
+              cur += '"';
+              i++; // skip escaped quote
+            } else {
+              inQuotes = !inQuotes;
+            }
+          } else if (ch === delim && !inQuotes) {
+            out.push(cur);
+            cur = '';
+          } else {
+            cur += ch;
+          }
+        }
+        out.push(cur);
+        return out;
+      }
+
+  const headerCols = splitCsvLine(headerLine, delimiter).map(c => c.trim());
+      // Build header map (case-insensitive)
+      const headerMap = {};
+      headerCols.forEach((name, idx) => { headerMap[name.toLowerCase()] = idx; });
+
+      // Require id, start_date, resolved_date headers; days_to_resolve is optional (we can compute it)
+      const required = ['id','start_date','resolved_date'];
+      const missing = required.filter(col => headerMap[col] === undefined);
+      if (missing.length > 0) return { headerError: 'CSV must contain columns id,start_date,resolved_date.', rows: [], invalidCount: 0 };
+
+      const rows = [];
+      let invalidCount = 0;
+      let firstParsed = null;
+      const diagnostics = [];
+
+      for (let i = headerLineIndex + 1; i < lines.length; i++) {
+        const raw = lines[i];
+        if (!raw || raw.trim() === '') continue;
+        const cols = splitCsvLine(raw, delimiter);
+        const diag = { line: i+1, raw: raw, cols: cols.map(c=>c.trim()), errors: [] };
+
+        // allow short rows but record error
+        if (cols.length < headerCols.length) {
+          diag.errors.push('Wrong column count');
+          diagnostics.push(diag); invalidCount++; continue;
+        }
+
+        const id = (cols[headerMap['id']] || '').trim().replace(/^"|"$/g, '');
+        const startStr = (cols[headerMap['start_date']] || '').trim().replace(/^"|"$/g, '');
+        const resolvedStr = (cols[headerMap['resolved_date']] || '').trim().replace(/^"|"$/g, '');
+        const daysStr = (headerMap['days_to_resolve'] !== undefined) ? (cols[headerMap['days_to_resolve']] || '').trim().replace(/^"|"$/g, '') : '';
+
+        if (!id) diag.errors.push('Missing id');
+        if (!startStr) diag.errors.push('Missing start_date');
+        if (!resolvedStr) diag.errors.push('Missing resolved_date');
+
+        const startDate = parseDateFlexible(startStr);
+        const resolvedDate = parseDateFlexible(resolvedStr);
+        if (!startDate) diag.errors.push('Could not parse start_date: ' + startStr);
+        if (!resolvedDate) diag.errors.push('Could not parse resolved_date: ' + resolvedStr);
+
+        let daysToResolve = null;
+        if (daysStr) {
+          const n = Number(daysStr);
+          if (!isNaN(n)) daysToResolve = Math.ceil(n);
+          else diag.errors.push('Invalid days_to_resolve value: ' + daysStr);
+        }
+
+        if (startDate && resolvedDate) {
+          const rawDiff = diffDays(startDate, resolvedDate);
+          if (rawDiff < 0) diag.errors.push('resolved_date is before start_date');
+          // prefer computed days; if daysToResolve provided but disagrees, add warning
+          const computed = Math.ceil(rawDiff);
+          if (daysToResolve === null) daysToResolve = computed;
+          else if (Math.abs(daysToResolve - computed) > 0) diag.errors.push('days_to_resolve disagrees with computed diff ('+daysToResolve+' vs '+computed+')');
+        }
+
+        if (diag.errors.length === 0) {
+          if (!firstParsed) firstParsed = cols.map(c => c.trim());
+          // normalize parsed dates to midnight so x-coordinates align with day-based shading/ticks
+          const normStart = normalizeToMidnight(startDate);
+          const normResolved = normalizeToMidnight(resolvedDate);
+          rows.push({ id, startDate: normStart, resolvedDate: normResolved, resolvedDateStr: formatDateKey(normResolved), daysToResolve });
+        } else {
+          diagnostics.push(diag); invalidCount++;
+        }
+      }
+
+      return { headerError: null, rows, invalidCount, headerCols, firstParsed, diagnostics };
+    }
+
+    function computeStatsAndChartData(rows, filterStart, filterEnd) {
+      if (!rows || rows.length === 0 || !filterStart || !filterEnd) return { filteredRows: [], scatterPoints: [], yMax: 10, stats: { p95: null, p85: null, p50: null, p15: null, mean: null }, maData: [], xDomain: [0,1] };
+
+      // Debug: log filter range
+      console.log('computeStatsAndChartData: filterStart=', filterStart.toISOString ? filterStart.toISOString() : filterStart, 'filterEnd=', filterEnd.toISOString ? filterEnd.toISOString() : filterEnd);
+      if (rows.length > 0) {
+        const minRes = rows.reduce((a,b) => a.resolvedDate < b.resolvedDate ? a : b).resolvedDate;
+        const maxRes = rows.reduce((a,b) => a.resolvedDate > b.resolvedDate ? a : b).resolvedDate;
+        console.log('  data range: min resolvedDate=', minRes.toISOString ? minRes.toISOString() : minRes, 'max=', maxRes.toISOString ? maxRes.toISOString() : maxRes);
+      }
+
+      const filteredRows = rows.filter(r => r.resolvedDate >= filterStart && r.resolvedDate <= filterEnd);
+      console.log('  filter result: filteredRows.length=', filteredRows.length, 'out of', rows.length);
+      if (filteredRows.length === 0) return { filteredRows, scatterPoints: [], yMax: 10, stats: { p95: null, p85: null, p50: null, p15: null, mean: null }, maData: [], xDomain: [filterStart.getTime(), filterEnd.getTime()] };
+
+      const groups = {};
+      let maxY = 0;
+      filteredRows.forEach(r => {
+        const key = r.resolvedDateStr + '|' + r.daysToResolve;
+        if (!groups[key]) groups[key] = { x: r.resolvedDate.getTime(), resolvedDate: r.resolvedDate, resolvedDateStr: r.resolvedDateStr, daysToResolve: r.daysToResolve, ids: [] };
+        groups[key].ids.push(r.id);
+        if (r.daysToResolve > maxY) maxY = r.daysToResolve;
+      });
+
+      const scatterPoints = Object.values(groups).map(g => ({ ...g, count: g.ids.length, labelCount: g.ids.length > 1 ? g.ids.length : '' })).sort((a,b) => a.x - b.x);
+      if (maxY === 0) maxY = 1;
+
+      const values = filteredRows.map(r => r.daysToResolve).sort((a,b) => a - b);
+      const mean = values.reduce((s,v) => s+v, 0) / values.length;
+      function percentile(arr, p) { if (!arr.length) return null; if (arr.length ===1) return arr[0]; const idx = (p/100)*(arr.length-1); const lower = Math.floor(idx); const upper = Math.ceil(idx); if (lower===upper) return arr[lower]; const w = idx-lower; return arr[lower]*(1-w)+arr[upper]*w; }
+      const stats = { p95: percentile(values,95), p85: percentile(values,85), p50: percentile(values,50), p15: percentile(values,15), mean };
+      const maData = computeMovingAverages(filteredRows);
+      // Use filter range for x-axis domain so chart extends to full filter date range, not just data range
+      const xDomain = [filterStart.getTime(), filterEnd.getTime()];
+      return { filteredRows, scatterPoints, yMax: maxY, stats, maData, xDomain };
+    }
+
+    function computeMovingAverages(rows) {
+      if (!rows || rows.length === 0) return [];
+      const valuesByDateKey = new Map();
+      let minDate = null, maxDate = null;
+      rows.forEach(r => { const d = r.resolvedDate; const k = formatDateKey(d); if (!valuesByDateKey.has(k)) valuesByDateKey.set(k, []); valuesByDateKey.get(k).push(r.daysToResolve); if (!minDate || d < minDate) minDate = d; if (!maxDate || d > maxDate) maxDate = d; });
+      minDate = new Date(minDate.getFullYear(), minDate.getMonth(), minDate.getDate()); maxDate = new Date(maxDate.getFullYear(), maxDate.getMonth(), maxDate.getDate());
+      const result = []; let prev7=null, prev28=null;
+      for (let d = new Date(minDate); d <= maxDate; d = addDays(d,1)) {
+        const ts = d.getTime();
+        const start7 = addDays(d,-6); let sum7=0, count7=0; for (let cur = new Date(start7); cur<=d; cur=addDays(cur,1)){ const a = valuesByDateKey.get(formatDateKey(cur)); if (a) { a.forEach(v=>{ sum7+=v; count7++; }); } }
+        let ma7 = null; if (count7>0) ma7 = sum7/count7; else if (prev7 !== null) ma7 = prev7;
+        const start28 = addDays(d,-27); let sum28=0, count28=0; for (let cur=new Date(start28); cur<=d; cur=addDays(cur,1)){ const a = valuesByDateKey.get(formatDateKey(cur)); if (a) { a.forEach(v=>{ sum28+=v; count28++; }); } }
+        let ma28 = null; if (count28>0) ma28 = sum28/count28; else if (prev28 !== null) ma28 = prev28;
+        result.push({ x: ts, ma7: ma7, ma28: ma28 }); if (ma7!==null) prev7 = ma7; if (ma28!==null) prev28 = ma28;
+      }
+      return result;
+    }
+
+    function formatDateFromTs(ts) { return formatDateKey(new Date(ts)); }
+
+  // DOM building
+  const root = document.getElementById('root');
+  root.innerHTML = '';
+  // Page title
+  const pageTitle = document.createElement('h1'); pageTitle.textContent = 'Flow Metrics Dashboard'; pageTitle.style.margin='0 0 14px 0'; pageTitle.style.fontSize='20px'; root.appendChild(pageTitle);
+
+  // Upload card (file input, template, status, debug controls)
+  const uploadCard = document.createElement('div'); uploadCard.className = 'card'; root.appendChild(uploadCard);
+  const uploadTitle = document.createElement('h2'); uploadTitle.textContent = 'Data Upload'; uploadTitle.style.fontSize='16px'; uploadTitle.style.margin='0 0 10px 0'; uploadCard.appendChild(uploadTitle);
+
+  // Chart card for Time to Resolve
+  const chartCard = document.createElement('div'); chartCard.className = 'card'; chartCard.style.marginTop='18px'; root.appendChild(chartCard);
+  const chartTitle = document.createElement('h1'); chartTitle.textContent = 'Time to Resolve'; chartTitle.style.fontSize='18px'; chartCard.appendChild(chartTitle);
+
+  // Upload row
+  const row = document.createElement('div'); row.className = 'row'; uploadCard.appendChild(row);
+    const field1 = document.createElement('div'); field1.className = 'field'; row.appendChild(field1);
+    const labelFile = document.createElement('label'); labelFile.textContent = 'Upload CSV file'; field1.appendChild(labelFile);
+    const inputFile = document.createElement('input'); inputFile.type = 'file'; inputFile.accept = '.csv'; field1.appendChild(inputFile);
+    const uploadNote = document.createElement('div'); uploadNote.className = 'upload-note'; uploadNote.textContent = 'Expected columns: id,start_date,resolved_date,days_to_resolve (YYYY-MM-DD dates).'; field1.appendChild(uploadNote);
+
+  const field2 = document.createElement('div'); field2.className = 'field'; row.appendChild(field2);
+    const labelBlank = document.createElement('label'); labelBlank.innerHTML = '&nbsp;'; field2.appendChild(labelBlank);
+    const btnTemplate = document.createElement('button'); btnTemplate.type = 'button'; btnTemplate.textContent = 'Download template CSV'; field2.appendChild(btnTemplate);
+
+  const statusMessage = document.createElement('div'); statusMessage.className = 'status-message info'; uploadCard.appendChild(statusMessage);
+  const errorMessage = document.createElement('div'); errorMessage.className = 'status-message error'; uploadCard.appendChild(errorMessage);
+  const diagnostic = document.createElement('div'); diagnostic.className = 'status-message'; diagnostic.style.marginTop = '8px'; uploadCard.appendChild(diagnostic);
+
+  // Debug controls
+  const debugControls = document.createElement('div'); debugControls.style.marginTop = '8px'; uploadCard.appendChild(debugControls);
+  const autoComputeLabel = document.createElement('label'); autoComputeLabel.style.marginRight='12px'; const autoCompute = document.createElement('input'); autoCompute.type='checkbox'; autoCompute.checked = true; autoComputeLabel.appendChild(autoCompute); autoComputeLabel.appendChild(document.createTextNode(' Auto-compute days_to_resolve (when missing)')); debugControls.appendChild(autoComputeLabel);
+  const debugToggle = document.createElement('button'); debugToggle.type='button'; debugToggle.textContent='Show debug details'; debugControls.appendChild(debugToggle);
+  // Stats toggle: show stats above the chart by default
+  const statsToggleLabel = document.createElement('label'); statsToggleLabel.style.marginLeft='12px'; statsToggleLabel.style.marginRight='8px'; const statsToggle = document.createElement('input'); statsToggle.type='checkbox'; statsToggle.checked = true; statsToggleLabel.appendChild(statsToggle); statsToggleLabel.appendChild(document.createTextNode(' Show stats above chart')); debugControls.appendChild(statsToggleLabel);
+  const debugDetails = document.createElement('div'); debugDetails.style.marginTop='8px'; debugDetails.style.display='none'; debugDetails.style.maxHeight='260px'; debugDetails.style.overflow='auto'; debugDetails.className='debug-details'; uploadCard.appendChild(debugDetails);
+
+  // short explanation text about confidence intervals and margin of error
+  const ciExplain = document.createElement('div'); ciExplain.className = 'chart-subtext'; ciExplain.style.marginTop='8px'; ciExplain.style.fontSize='13px'; ciExplain.style.color='var(--muted)'; ciExplain.innerHTML = '<strong>Confidence interval & margin of error</strong>: The confidence interval gives a range around a sample estimate (for example, the mean) that likely contains the true population value. The margin of error (MoE) is half the width of that interval; a 95% CI uses a larger z-score than a 90% CI, so the 95% MoE is larger. Here we show the Mean ± MoE for 90% and 95% confidence.'; uploadCard.appendChild(ciExplain);
+
+  // Stats bar shown above the chart (on by default)
+  const statsBar = document.createElement('div'); statsBar.className = 'stats-bar'; statsBar.style.marginTop = '8px'; statsBar.style.fontFamily = 'monospace'; statsBar.style.display = statsToggle.checked ? 'block' : 'none'; statsBar.style.background = '#fafafa'; statsBar.style.padding = '8px'; statsBar.style.borderRadius = '6px'; statsBar.style.border = '1px solid #eee'; chartCard.appendChild(statsBar);
+  statsToggle.addEventListener('change', ()=>{ statsBar.style.display = statsToggle.checked ? 'block' : 'none'; });
+
+  function formatNum(v) { return (v === null || v === undefined) ? 'N/A' : (Math.round(v*100)/100).toString(); }
+  // sample standard deviation
+  function sampleStd(arr){ if(!arr||arr.length<=1) return 0; const m = arr.reduce((s,v)=>s+v,0)/arr.length; const ss = arr.reduce((s,v)=>s + Math.pow(v-m,2),0); return Math.sqrt(ss/(arr.length-1)); }
+
+  function renderStatsBar(s, ci) {
+    if (!s) { statsBar.textContent = ''; return; }
+    let base = `P95: ${formatNum(s.p95)}   P85: ${formatNum(s.p85)}   P50: ${formatNum(s.p50)}   P15: ${formatNum(s.p15)}   Mean: ${formatNum(s.mean)}`;
+    if (ci) {
+      base += `<div style="margin-top:6px; font-size:12px; color:var(--muted)">&nbsp;Mean ± MoE (90%): ${formatNum(ci.moe90)} | Mean ± MoE (95%): ${formatNum(ci.moe95)} (n=${ci.n})</div>`;
+    }
+    statsBar.innerHTML = base;
+  }
+
+  // Filters
+  const filtersDiv = document.createElement('div'); filtersDiv.style.marginTop = '16px'; chartCard.appendChild(filtersDiv);
+    const startField = document.createElement('div'); startField.className = 'field'; startField.style.display='inline-block'; startField.style.marginRight='12px'; filtersDiv.appendChild(startField);
+    const lblStart = document.createElement('label'); lblStart.textContent = 'Start Date (Resolved)'; startField.appendChild(lblStart);
+    const inputStart = document.createElement('input'); inputStart.type = 'date'; startField.appendChild(inputStart);
+    const endField = document.createElement('div'); endField.className = 'field'; endField.style.display='inline-block'; filtersDiv.appendChild(endField);
+    const lblEnd = document.createElement('label'); lblEnd.textContent = 'End Date (Resolved)'; endField.appendChild(lblEnd);
+    const inputEnd = document.createElement('input'); inputEnd.type = 'date'; endField.appendChild(inputEnd);
+
+  // Toggles
+  const togglesDiv = document.createElement('div'); togglesDiv.className = 'toggles-row'; togglesDiv.style.marginTop='12px'; chartCard.appendChild(togglesDiv);
+    const toggles = { p95: true, p85: true, p50: true, p15: true, mean: true, ma7: true, ma28: true };
+    // map of toggle name -> array of input elements (keeps top and requests-chart toggles in sync)
+    const toggleInputsMap = {};
+    function makeToggle(name, label) {
+      const lab = document.createElement('label'); lab.className='toggle'; const cb = document.createElement('input'); cb.type='checkbox'; cb.checked = toggles[name];
+      // register input
+      toggleInputsMap[name] = toggleInputsMap[name] || [];
+      toggleInputsMap[name].push(cb);
+      cb.addEventListener('change', ()=>{
+        toggles[name]=cb.checked;
+        // propagate to all linked inputs
+        (toggleInputsMap[name]||[]).forEach(el=>{ if (el !== cb) el.checked = cb.checked; });
+        renderChart(); try{ renderRequestsChart(); }catch(e){}
+      });
+      lab.appendChild(cb); const span = document.createElement('span'); span.textContent = label; lab.appendChild(span); togglesDiv.appendChild(lab);
+    }
+    makeToggle('p95','P95'); makeToggle('p85','P85'); makeToggle('p50','P50'); makeToggle('p15','P15'); makeToggle('mean','Mean'); makeToggle('ma7','7-day MA'); makeToggle('ma28','28-day MA');
+
+  // Chart container
+  const chartContainer = document.createElement('div'); chartContainer.className = 'chart-container'; chartCard.appendChild(chartContainer);
+  // make container relative so absolute tooltip can be positioned inside it
+  chartContainer.style.position = 'relative';
+  const svg = document.createElementNS('http://www.w3.org/2000/svg','svg'); svg.setAttribute('width','100%'); svg.setAttribute('height','100%'); chartContainer.appendChild(svg);
+  // tooltip for hover over points
+  const pointTooltip = document.createElement('div'); pointTooltip.className = 'point-tooltip'; pointTooltip.style.display='none'; chartContainer.appendChild(pointTooltip);
+    const noData = document.createElement('div'); noData.className='no-data-message'; noData.textContent='Upload a CSV file to see the chart.'; chartContainer.appendChild(noData);
+
+  // Subtext
+  const sub = document.createElement('div'); sub.className='chart-subtext'; sub.style.marginTop='12px'; sub.textContent = 'Chart shows Days to Resolve by Resolved Date. Invalid rows are skipped.'; chartCard.appendChild(sub);
+
+    // State
+    let rows = [];
+    let filteredRows = [];
+    let scatterPoints = [];
+    let stats = {};
+    let maData = [];
+
+    function setStatus(msg) { statusMessage.textContent = msg; }
+    function setError(msg) { errorMessage.textContent = msg; }
+
+    btnTemplate.addEventListener('click', ()=>{
+      const csv = 'id,start_date,resolved_date,days_to_resolve\nTICKET-001,2025-01-01,2025-01-03,2\nTICKET-002,2025-01-05,2025-01-05,0\nTICKET-003,2025-02-10,2025-02-15,5\n';
+      const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+      const url = URL.createObjectURL(blob); const a = document.createElement('a'); a.href=url; a.download='time_to_resolve_template.csv'; document.body.appendChild(a); a.click(); document.body.removeChild(a); URL.revokeObjectURL(url);
+    });
+
+    inputFile.addEventListener('change', (e) => {
+      const file = e.target.files && e.target.files[0];
+      if (!file) return;
+
+      const reader = new FileReader();
+      reader.onload = (ev) => {
+        const text = ev.target.result;
+        const res = parseCsv(text);
+
+        if (res.headerError) {
+          setError(res.headerError);
+          setStatus('');
+          diagnostic.textContent = '';
+          rows = [];
+          renderChart();
+          try { if (typeof renderRequestsChart === 'function') renderRequestsChart(); } catch (e) {}
+          try { if (typeof renderResolvedChart === 'function') renderResolvedChart(); } catch (e) {}
+          return;
+        }
+
+        setError('');
+        rows = res.rows;
+        setStatus(`File loaded: ${rows.length} valid row(s), ${res.invalidCount} invalid row(s).`);
+
+        // Diagnostic output: parsed header and first parsed row
+        try {
+          diagnostic.textContent = 'Parsed header: ' + (res.headerCols ? res.headerCols.join(', ') : 'N/A') + '\n' + 'First parsed row: ' + (res.firstParsed ? res.firstParsed.join(', ') : 'N/A');
+        } catch (err) {
+          diagnostic.textContent = '';
+        }
+
+        // Populate debug details panel with per-row diagnostics (if present)
+        try {
+          debugDetails.innerHTML = '';
+          if (res.diagnostics && res.diagnostics.length) {
+            const invalidHeader = document.createElement('div'); invalidHeader.textContent = 'Invalid rows: ' + res.diagnostics.length; invalidHeader.style.fontWeight='bold'; debugDetails.appendChild(invalidHeader);
+            const ul = document.createElement('ul'); ul.style.fontSize='12px'; ul.style.margin='6px 0 8px 16px';
+            res.diagnostics.slice(0,200).forEach(d => {
+              const li = document.createElement('li'); li.textContent = `Line ${d.line}: ${d.errors.join('; ')} -- Raw: ${d.raw.slice(0,200)}`; ul.appendChild(li);
+            });
+            debugDetails.appendChild(ul);
+          } else {
+            const ok = document.createElement('div'); ok.textContent = 'No invalid rows detected.'; debugDetails.appendChild(ok);
+          }
+
+          // Show some sample valid rows
+          if (rows && rows.length) {
+            const s = document.createElement('div'); s.textContent = 'Sample valid rows (up to 10):'; s.style.fontWeight='bold'; s.style.marginTop='6px'; debugDetails.appendChild(s);
+            const okul = document.createElement('ul'); okul.style.fontSize='12px'; okul.style.margin='6px 0 8px 16px';
+            rows.slice(0,10).forEach(r => { const li = document.createElement('li'); li.textContent = `${r.id} | ${formatDateKey(r.startDate)} -> ${formatDateKey(r.resolvedDate)} | days: ${r.daysToResolve}`; okul.appendChild(li); });
+            debugDetails.appendChild(okul);
+          }
+
+          // Add copy button
+          const copyBtn = document.createElement('button'); copyBtn.type='button'; copyBtn.textContent='Copy debug text'; copyBtn.style.marginTop='8px'; debugDetails.appendChild(copyBtn);
+          copyBtn.addEventListener('click', ()=>{
+            let out = `Status: ${statusMessage.textContent}\n\n`;
+            if (res.diagnostics && res.diagnostics.length) {
+              out += `Invalid rows (${res.diagnostics.length}):\n` + res.diagnostics.map(d=>`Line ${d.line}: ${d.errors.join('; ')} -- ${d.raw}`).slice(0,200).join('\n') + '\n\n';
+            }
+            if (rows && rows.length) out += 'Sample valid rows:\n' + rows.slice(0,50).map(r=>`${r.id},${formatDateKey(r.startDate)},${formatDateKey(r.resolvedDate)},${r.daysToResolve}`).join('\n');
+            navigator.clipboard && navigator.clipboard.writeText ? navigator.clipboard.writeText(out).then(()=>{ alert('Debug copied to clipboard'); }).catch(()=>{ alert('Copy failed'); }) : alert('Clipboard not available');
+          });
+        } catch (err) {
+          debugDetails.textContent = '';
+        }
+
+        // Wire debug toggle
+        debugToggle.onclick = () => { if (debugDetails.style.display==='none') { debugDetails.style.display='block'; debugToggle.textContent='Hide debug details'; } else { debugDetails.style.display='none'; debugToggle.textContent='Show debug details'; } };
+
+        if (rows.length === 0) {
+          renderChart();
+          try { if (typeof renderRequestsChart === 'function') renderRequestsChart(); } catch (e) {}
+          try { if (typeof renderResolvedChart === 'function') renderResolvedChart(); } catch (e) {}
+          return;
+        }
+
+        const minDate = rows.reduce((acc, r) => (acc && acc < r.resolvedDate ? acc : r.resolvedDate), rows[0].resolvedDate);
+        const maxDate = rows.reduce((acc, r) => (acc && acc > r.resolvedDate ? acc : r.resolvedDate), rows[0].resolvedDate);
+
+        inputStart.value = formatDateKey(new Date(minDate.getFullYear(), minDate.getMonth(), minDate.getDate()));
+        inputEnd.value = formatDateKey(new Date(maxDate.getFullYear(), maxDate.getMonth(), maxDate.getDate()));
+
+        // set created-date filters defaults
+        try {
+          const minStart = rows.reduce((acc, r) => (acc && acc < r.startDate ? acc : r.startDate), rows[0].startDate);
+          const maxStart = rows.reduce((acc, r) => (acc && acc > r.startDate ? acc : r.startDate), rows[0].startDate);
+          if (typeof inputCStart !== 'undefined') inputCStart.value = formatDateKey(new Date(minStart.getFullYear(), minStart.getMonth(), minStart.getDate()));
+          if (typeof inputCEnd !== 'undefined') inputCEnd.value = formatDateKey(new Date(maxStart.getFullYear(), maxStart.getMonth(), maxStart.getDate()));
+        } catch (e) {}
+
+  renderChart();
+  try { if (typeof renderRequestsChart === 'function') renderRequestsChart(); } catch (e) {}
+  try { if (typeof renderResolvedChart === 'function') renderResolvedChart(); } catch (e) {}
+      };
+
+      reader.readAsText(file);
+    });
+
+    inputStart.addEventListener('change', renderChart);
+    inputEnd.addEventListener('change', renderChart);
+
+    function renderChart() {
+      // clear svg
+      console.log('renderChart called', inputStart.value, inputEnd.value);
+      while (svg.firstChild) svg.removeChild(svg.firstChild);
+      if (!rows || rows.length===0) { noData.style.display='block'; return; } noData.style.display='none';
+
+      const start = parseDateYMD(inputStart.value) || new Date(Math.min(...rows.map(r=>r.resolvedDate.getTime())));
+      const end = parseDateYMD(inputEnd.value) || new Date(Math.max(...rows.map(r=>r.resolvedDate.getTime())));
+      if (end < start) { setError('End Date must be on or after Start Date.'); return; } setError('');
+
+  const data = computeStatsAndChartData(rows, start, end);
+  filteredRows = data.filteredRows; scatterPoints = data.scatterPoints; stats = data.stats; maData = data.maData; const yMax = data.yMax; const xMin = data.xDomain[0]; const xMax = data.xDomain[1];
+  // compute CI / MoE for days_to_resolve (mean)
+  let ciDays = null;
+  try {
+    const vals = filteredRows.map(r=>r.daysToResolve);
+    const n = vals.length;
+    if (n > 0) {
+      const sd = sampleStd(vals);
+      const se = sd / Math.sqrt(n);
+      const moe90 = 1.645 * se;
+      const moe95 = 1.96 * se;
+      ciDays = { n, sd, se, moe90, moe95 };
+    }
+  } catch(e) { ciDays = null; }
+  // update stats bar (includes CI info when available)
+  try { if (typeof renderStatsBar === 'function' && statsToggle && statsToggle.checked) renderStatsBar(stats, ciDays); } catch(e) {}
+
+  const rect = chartContainer.getBoundingClientRect(); const width = Math.max(600, rect.width || 800); const height = 420; svg.setAttribute('viewBox', `0 0 ${width} ${height}`);
+  // increase right margin so horizontal labels (P95, Mean, etc.) are visible
+  const margin = { left:60, right:120, top:20, bottom:40 }; const innerW = width - margin.left - margin.right; const innerH = height - margin.top - margin.bottom;
+
+      // axes
+      const axisG = document.createElementNS('http://www.w3.org/2000/svg','g'); axisG.setAttribute('transform', `translate(${margin.left},${margin.top})`); svg.appendChild(axisG);
+      // x axis line
+      const xLine = document.createElementNS('http://www.w3.org/2000/svg','line'); xLine.setAttribute('x1',0); xLine.setAttribute('y1',innerH); xLine.setAttribute('x2',innerW); xLine.setAttribute('y2',innerH); xLine.setAttribute('stroke','#444'); axisG.appendChild(xLine);
+      // y axis line
+      const yLine = document.createElementNS('http://www.w3.org/2000/svg','line'); yLine.setAttribute('x1',0); yLine.setAttribute('y1',0); yLine.setAttribute('x2',0); yLine.setAttribute('y2',innerH); yLine.setAttribute('stroke','#444'); axisG.appendChild(yLine);
+
+      function sx(ts) { if (xMax===xMin) return innerW/2; return (ts - xMin)/(xMax - xMin) * innerW; }
+      function sy(v) { return innerH - (v / yMax) * innerH; }
+
+      // highlight weekends with very light vertical bars (Saturday+Sunday)
+      try {
+        // create a background group before the axis group so shading sits behind grid/points
+        const bgG = document.createElementNS('http://www.w3.org/2000/svg','g');
+        bgG.setAttribute('transform', `translate(${margin.left},${margin.top})`);
+        svg.insertBefore(bgG, axisG);
+        let d = new Date(xMin);
+        d = new Date(d.getFullYear(), d.getMonth(), d.getDate());
+  const HALF_DAY = 12 * 60 * 60 * 1000; // currently we shifted by +12h earlier
+  const SHIFT_BACK = -24 * 60 * 60 * 1000; // move shading back by 24 hours relative to current
+        while (d.getTime() <= xMax) {
+          if (d.getDay() === 6) {
+            // shift start and end by +12 hours so shading begins at noon (approx) instead of midnight
+            let satStart = new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime() + HALF_DAY;
+            let monStart = addDays(d,2).getTime() + HALF_DAY;
+            // move back 24 hours as requested
+            satStart += SHIFT_BACK;
+            monStart += SHIFT_BACK;
+            const left = sx(Math.max(satStart, xMin));
+            const right = sx(Math.min(monStart, xMax));
+            const w = Math.max(0, right - left);
+            if (w > 0) {
+              const r = document.createElementNS('http://www.w3.org/2000/svg','rect');
+              r.setAttribute('x', left);
+              r.setAttribute('y', 0);
+              r.setAttribute('width', w);
+              r.setAttribute('height', innerH);
+              r.setAttribute('fill', 'rgba(15,23,42,0.03)');
+              bgG.appendChild(r);
+            }
+            d = addDays(d,7);
+          } else {
+            d = addDays(d,1);
+          }
+        }
+      } catch (e) {}
+
+      // helper: find a nearby y that doesn't collide with any existing label y positions
+      function computeSafeLabelY(desiredY, existingYs, minSep, topBound, bottomBound) {
+        existingYs = (existingYs || []).slice();
+        // quick check
+        function safeAt(y) { for (let i=0;i<existingYs.length;i++){ if (Math.abs(y - existingYs[i]) < minSep) return false; } return true; }
+        if (safeAt(desiredY) && desiredY >= topBound && desiredY <= bottomBound) return desiredY;
+        // search outward for nearest safe position
+        const maxRadius = Math.max(40, Math.round((bottomBound-topBound)/2));
+        for (let d=1; d<=maxRadius; d++) {
+          const up = desiredY - d;
+          if (up >= topBound && safeAt(up)) return up;
+          const down = desiredY + d;
+          if (down <= bottomBound && safeAt(down)) return down;
+        }
+        // fallback: clamp to bounds
+        let y = Math.max(topBound, Math.min(bottomBound, desiredY));
+        // push away from nearest existing label
+        for (let i=0;i<existingYs.length;i++){ if (Math.abs(y - existingYs[i]) < minSep) { y = existingYs[i] + minSep; } }
+        return Math.max(topBound, Math.min(bottomBound, y));
+      }
+
+      // x ticks: 6 ticks
+      for (let i=0;i<=6;i++){ const t = xMin + (i/6)*(xMax - xMin); const x = sx(t); const tx = document.createElementNS('http://www.w3.org/2000/svg','text'); tx.setAttribute('x', x); tx.setAttribute('y', innerH+16); tx.setAttribute('font-size','11'); tx.setAttribute('fill','#444'); tx.setAttribute('text-anchor','middle'); tx.textContent = formatDateFromTs(Math.round(t)); axisG.appendChild(tx); }
+
+      // X-axis label for Time to Resolve chart
+      try {
+        const xLabel = document.createElementNS('http://www.w3.org/2000/svg','text');
+        xLabel.setAttribute('x', innerW / 2);
+        xLabel.setAttribute('y', innerH + 36);
+        xLabel.setAttribute('font-size', '12');
+        xLabel.setAttribute('fill', 'var(--muted)');
+        xLabel.setAttribute('text-anchor', 'middle');
+        xLabel.textContent = 'Resolved Date';
+        axisG.appendChild(xLabel);
+      } catch(e) {}
+
+      // y ticks
+      const yTicks = Math.min(8, Math.max(2, Math.ceil(yMax/1)));
+      for (let i=0;i<=yTicks;i++){ const v = (i/yTicks)*yMax; const y = sy(v); const ty = document.createElementNS('http://www.w3.org/2000/svg','text'); ty.setAttribute('x', -8); ty.setAttribute('y', y+4); ty.setAttribute('font-size','11'); ty.setAttribute('fill','#444'); ty.setAttribute('text-anchor','end'); ty.textContent = Math.round(v); axisG.appendChild(ty); const grid = document.createElementNS('http://www.w3.org/2000/svg','line'); grid.setAttribute('x1',0); grid.setAttribute('y1',y); grid.setAttribute('x2',innerW); grid.setAttribute('y2',y); grid.setAttribute('stroke','#e0e0e0'); axisG.appendChild(grid); }
+
+      // Y-axis label for Time to Resolve chart
+      try {
+        const yLabel = document.createElementNS('http://www.w3.org/2000/svg','text');
+        yLabel.setAttribute('x', -40);
+        yLabel.setAttribute('y', innerH / 2);
+        yLabel.setAttribute('font-size', '12');
+        yLabel.setAttribute('fill', 'var(--muted)');
+        yLabel.setAttribute('text-anchor', 'middle');
+        yLabel.setAttribute('transform', `rotate(-90 ${-40} ${innerH/2})`);
+        yLabel.textContent = 'Days To Resolve';
+        axisG.appendChild(yLabel);
+      } catch(e) {}
+
+      // horizontal stats lines
+      function drawH(yVal, color, dash, label) { if (yVal===null) return; const y = sy(yVal); const l = document.createElementNS('http://www.w3.org/2000/svg','line'); l.setAttribute('x1',0); l.setAttribute('y1',y); l.setAttribute('x2',innerW); l.setAttribute('y2',y); l.setAttribute('stroke',color); if (dash) l.setAttribute('stroke-dasharray', '4 4'); axisG.appendChild(l); const t = document.createElementNS('http://www.w3.org/2000/svg','text'); t.setAttribute('x', innerW+6); t.setAttribute('y', y+4); t.setAttribute('font-size','11'); t.setAttribute('fill',color); t.textContent = label; axisG.appendChild(t); }
+  if (toggles.p95) drawH(stats.p95, '#999', true, 'P95'); if (toggles.p85) drawH(stats.p85, '#999', true, 'P85'); if (toggles.p50) drawH(stats.p50, '#999', true, 'P50'); if (toggles.p15) drawH(stats.p15, '#999', true, 'P15'); if (toggles.mean) drawH(stats.mean, '#e3120b', false, 'Mean');
+
+  // collect existing right-side label Y positions (so MA labels avoid colliding)
+  const existingLabelYs = [];
+  if (toggles.p95 && stats.p95 != null) existingLabelYs.push(sy(stats.p95));
+  if (toggles.p85 && stats.p85 != null) existingLabelYs.push(sy(stats.p85));
+  if (toggles.p50 && stats.p50 != null) existingLabelYs.push(sy(stats.p50));
+  if (toggles.p15 && stats.p15 != null) existingLabelYs.push(sy(stats.p15));
+  if (toggles.mean && stats.mean != null) existingLabelYs.push(sy(stats.mean));
+
+  // moving averages (as polyline)
+  function drawMA(key, color) {
+        if (!toggles[key]) return;
+        const field = key === 'ma7' ? 'ma7' : 'ma28';
+        const ptsArr = maData.filter(d => d[field] != null).map(d => ({ x: sx(d.x), y: sy(d[field]), rawX: d.x }));
+        if (ptsArr.length < 2) return;
+        const pts = ptsArr.map(p => `${p.x},${p.y}`);
+        const p = document.createElementNS('http://www.w3.org/2000/svg','polyline'); p.setAttribute('points', pts.join(' ')); p.setAttribute('fill','none'); p.setAttribute('stroke',color); p.setAttribute('stroke-width','1.5'); axisG.appendChild(p);
+        // label the MA near the last point with dynamic offset to avoid collisions
+        try {
+          const last = ptsArr[ptsArr.length - 1];
+          const desiredY = Math.max(8, Math.min(innerH - 8, last.y - 4));
+          // compute a safe y that doesn't collide with other labels
+          const minSep = 14; // pixels between label centers
+          const safeY = computeSafeLabelY(desiredY, existingLabelYs, minSep, 6, innerH - 6);
+          // reserve this y so next labels avoid it
+          existingLabelYs.push(safeY);
+          const lbl = document.createElementNS('http://www.w3.org/2000/svg','text');
+          const lx = Math.min(last.x + 6, innerW - 30);
+          lbl.setAttribute('x', lx);
+          lbl.setAttribute('y', Math.round(safeY));
+          lbl.setAttribute('font-size', '11');
+          lbl.setAttribute('fill', color);
+          lbl.setAttribute('text-anchor', 'start');
+          lbl.textContent = key === 'ma7' ? '7-day MA' : '28-day MA';
+          axisG.appendChild(lbl);
+        } catch (e) {
+          // ignore label placement errors
+        }
+      }
+  drawMA('ma7','#336699'); drawMA('ma28','var(--accent-2)');
+
+  // scatter points
+  scatterPoints.forEach(pt=>{
+        const cx = sx(pt.x);
+        const cy = sy(pt.daysToResolve);
+        const c = document.createElementNS('http://www.w3.org/2000/svg','circle');
+        c.setAttribute('cx', cx);
+        c.setAttribute('cy', cy);
+        c.setAttribute('r', Math.min(8, 4 + Math.log(pt.count+1)));
+        c.setAttribute('fill','#333');
+        c.style.cursor = 'pointer';
+        // show tooltip on hover with IDs and date/info
+        c.addEventListener('mouseenter', (ev) => {
+          const ids = pt.ids && pt.ids.length ? pt.ids.join(', ') : pt.ids;
+          pointTooltip.textContent = ids + ' — ' + pt.resolvedDateStr + ' — ' + pt.daysToResolve + 'd';
+          pointTooltip.style.display = 'block';
+        });
+        c.addEventListener('mousemove', (ev) => {
+          // position relative to chartContainer with edge-collision avoidance
+          const rectC = chartContainer.getBoundingClientRect();
+          const tooltipW = pointTooltip.offsetWidth || 120;
+          const tooltipH = pointTooltip.offsetHeight || 28;
+          const pad = 8;
+          // preferred position: to the right and below cursor
+          let left = ev.clientX - rectC.left + pad;
+          let top = ev.clientY - rectC.top + pad;
+          // if it would overflow right edge, flip to left of cursor
+          if (left + tooltipW + 4 > rectC.width) {
+            left = ev.clientX - rectC.left - tooltipW - pad;
+          }
+          // if it would overflow bottom edge, clamp up
+          if (top + tooltipH + 4 > rectC.height) {
+            top = rectC.height - tooltipH - 4;
+          }
+          // clamp to small margin on left/top
+          if (left < 4) left = 4;
+          if (top < 4) top = 4;
+          pointTooltip.style.left = Math.round(left) + 'px';
+          pointTooltip.style.top = Math.round(top) + 'px';
+        });
+        c.addEventListener('mouseleave', () => { pointTooltip.style.display = 'none'; });
+        axisG.appendChild(c);
+        if (pt.labelCount) {
+          const t = document.createElementNS('http://www.w3.org/2000/svg','text');
+          t.setAttribute('x', cx);
+          t.setAttribute('y', cy - 8);
+          t.setAttribute('font-size','11');
+          t.setAttribute('fill','#333');
+          t.setAttribute('text-anchor','middle');
+          t.textContent = pt.labelCount;
+          axisG.appendChild(t);
+        }
+      });
+
+      // debug: show how many rows were used for this render
+      try { console.log('renderChart finished: filteredRows=', filteredRows ? filteredRows.length : 0, 'stats.mean=', stats && stats.mean); } catch(e) {}
+
+      // ensure other charts refresh after this chart updates
+      try { if (typeof renderRequestsChart === 'function') renderRequestsChart(); } catch(e) { console.error('renderRequestsChart from renderChart failed', e); }
+      try { if (typeof renderResolvedChart === 'function') renderResolvedChart(); } catch(e) { console.error('renderResolvedChart from renderChart failed', e); }
+
+      }
+
+    // initial placeholder
+    renderChart();
+    // --- Requests per day card (second chart) ---
+  const card2 = document.createElement('div'); card2.className='card'; card2.style.marginTop='18px';
+  // insert card2 before the Time to Resolve card so Requests per Day appears first
+  root.insertBefore(card2, chartCard);
+    const h2 = document.createElement('h1'); h2.textContent = 'Number of Requests Submitted Per Day'; card2.appendChild(h2);
+
+    // created-date filters
+    const createdRow = document.createElement('div'); createdRow.className='row'; card2.appendChild(createdRow);
+    const createdField1 = document.createElement('div'); createdField1.className='field'; createdRow.appendChild(createdField1);
+    const lblCStart = document.createElement('label'); lblCStart.textContent='Start Date (Created)'; createdField1.appendChild(lblCStart);
+    const inputCStart = document.createElement('input'); inputCStart.type='date'; createdField1.appendChild(inputCStart);
+    const createdField2 = document.createElement('div'); createdField2.className='field'; createdRow.appendChild(createdField2);
+    const lblCEnd = document.createElement('label'); lblCEnd.textContent='End Date (Created)'; createdField2.appendChild(lblCEnd);
+    const inputCEnd = document.createElement('input'); inputCEnd.type='date'; createdField2.appendChild(inputCEnd);
+
+  // sync buttons to copy ranges between resolved and created filters
+  const syncRow = document.createElement('div'); syncRow.style.marginTop = '8px'; syncRow.style.display = 'flex'; syncRow.style.gap = '8px'; card2.appendChild(syncRow);
+  const btnCopyToCreated = document.createElement('button'); btnCopyToCreated.type = 'button'; btnCopyToCreated.textContent = 'Copy Resolved → Created'; btnCopyToCreated.style.padding='6px 10px'; btnCopyToCreated.addEventListener('click', ()=>{ if (inputStart.value) inputCStart.value = inputStart.value; if (inputEnd.value) inputCEnd.value = inputEnd.value; try{ renderRequestsChart(); }catch(e){} }); syncRow.appendChild(btnCopyToCreated);
+  const btnCopyToResolved = document.createElement('button'); btnCopyToResolved.type = 'button'; btnCopyToResolved.textContent = 'Copy Created → Resolved'; btnCopyToResolved.style.padding='6px 10px'; btnCopyToResolved.addEventListener('click', ()=>{ if (inputCStart.value) inputStart.value = inputCStart.value; if (inputCEnd.value) inputEnd.value = inputCEnd.value; try{ renderChart(); }catch(e){} }); syncRow.appendChild(btnCopyToResolved);
+
+    // legend for second chart
+  // controls: toggles for horizontal stat lines specific to the requests chart
+  const legendControls = document.createElement('div'); legendControls.style.marginTop='8px'; legendControls.style.display='flex'; legendControls.style.gap='12px'; legendControls.style.alignItems='center';
+  // make small toggle style similar to other toggles
+  function makeSmallToggle(name, labelText){ const lab = document.createElement('label'); lab.className='toggle'; lab.style.padding='4px 8px'; lab.style.fontSize='13px'; const cb = document.createElement('input'); cb.type='checkbox'; cb.checked = !!toggles[name];
+    // register this small toggle so it stays in sync with top toggles
+    toggleInputsMap[name] = toggleInputsMap[name] || [];
+    toggleInputsMap[name].push(cb);
+    cb.addEventListener('change', ()=>{ toggles[name]=cb.checked; // propagate to all linked inputs
+      (toggleInputsMap[name]||[]).forEach(el=>{ if (el !== cb) el.checked = cb.checked; });
+      try{ renderRequestsChart(); renderChart(); }catch(e){} }); lab.appendChild(cb); const span = document.createElement('span'); span.textContent = labelText; lab.appendChild(span); return lab; }
+  legendControls.appendChild(makeSmallToggle('p95','P95'));
+  legendControls.appendChild(makeSmallToggle('p85','P85'));
+  legendControls.appendChild(makeSmallToggle('p50','P50'));
+  legendControls.appendChild(makeSmallToggle('p15','P15'));
+  legendControls.appendChild(makeSmallToggle('mean','Mean'));
+  // add MA toggles here as well
+  legendControls.appendChild(makeSmallToggle('ma7','7-day MA'));
+  legendControls.appendChild(makeSmallToggle('ma28','28-day MA'));
+
+  // CI info area for requests chart (populated on render)
+  const ciInfo2 = document.createElement('div'); ciInfo2.style.marginTop = '8px'; ciInfo2.style.fontSize = '13px'; ciInfo2.style.color = 'var(--muted)'; ciInfo2.textContent = ''; card2.appendChild(ciInfo2);
+
+  const legend = document.createElement('div'); legend.style.marginTop='8px'; legend.style.display='flex'; legend.style.gap='12px'; legend.style.alignItems='center';
+    const makeLegend = (color, text) => { const d=document.createElement('div'); d.style.display='inline-flex'; d.style.alignItems='center'; d.style.gap='8px'; const sw=document.createElement('span'); sw.style.width='14px'; sw.style.height='10px'; sw.style.display='inline-block'; sw.style.background=color; sw.style.borderRadius='3px'; d.appendChild(sw); const t=document.createElement('span'); t.textContent=text; t.style.fontSize='13px'; t.style.color='var(--muted)'; d.appendChild(t); return d; };
+  legend.appendChild(makeLegend('rgba(37,99,235,0.18)','Daily count'));
+  legend.appendChild(makeLegend('var(--accent)','7-day MA'));
+  legend.appendChild(makeLegend('var(--accent-2)','28-day MA'));
+  card2.appendChild(legendControls);
+  card2.appendChild(legend);
+
+    // chart container 2
+    const chartContainer2 = document.createElement('div'); chartContainer2.className='chart-container'; chartContainer2.style.marginTop='10px'; card2.appendChild(chartContainer2);
+    chartContainer2.style.position='relative';
+    const svg2 = document.createElementNS('http://www.w3.org/2000/svg','svg'); svg2.setAttribute('width','100%'); svg2.setAttribute('height','100%'); chartContainer2.appendChild(svg2);
+    const noData2 = document.createElement('div'); noData2.className='no-data-message'; noData2.textContent='No requests in selected date range'; noData2.style.display='none'; chartContainer2.appendChild(noData2);
+    const barTooltip = document.createElement('div'); barTooltip.className='point-tooltip'; barTooltip.style.display='none'; chartContainer2.appendChild(barTooltip);
+
+    // helper: build array of dates between start and end inclusive
+    function buildDateRange(startDate, endDate) {
+      const arr=[]; for (let d=new Date(startDate.getFullYear(), startDate.getMonth(), startDate.getDate()); d<=endDate; d=addDays(d,1)){ arr.push(new Date(d.getFullYear(), d.getMonth(), d.getDate())); }
+      return arr;
+    }
+
+    function computeRequestsPerDay(allRows, start, end) {
+      if (!allRows) return { days: [], counts: [], ma7: [], ma28: [], xDomain:[0,1], yMax:1 };
+      const map = new Map(); allRows.forEach(r=>{ const k = formatDateKey(r.startDate); map.set(k, (map.get(k)||0)+1); });
+      const days = buildDateRange(start, end);
+      const counts = days.map(d=> ({date:d, ts: d.getTime(), count: map.get(formatDateKey(d)) || 0}) );
+      // compute ma7 and ma28 using zeros for missing days
+      const ma7 = []; const ma28 = [];
+      for (let i=0;i<counts.length;i++){
+        const start7 = Math.max(0, i-6); let sum7=0; for (let j=start7;j<=i;j++) sum7 += counts[j].count; ma7.push(sum7/(i-start7+1));
+        const start28 = Math.max(0, i-27); let sum28=0; for (let j=start28;j<=i;j++) sum28 += counts[j].count; ma28.push(sum28/(i-start28+1));
+      }
+      const yMax = Math.max(1, ...counts.map(c=>c.count));
+      return { days, counts, ma7, ma28, xDomain: [days[0] ? days[0].getTime() : 0, days.length? days[days.length-1].getTime() : 1], yMax };
+    }
+
+    function renderRequestsChart() {
+      while (svg2.firstChild) svg2.removeChild(svg2.firstChild);
+      if (!rows || rows.length===0) { noData2.style.display='block'; return; } noData2.style.display='none';
+      const start = parseDateYMD(inputCStart.value) || new Date(Math.min(...rows.map(r=>r.startDate.getTime())));
+      const end = parseDateYMD(inputCEnd.value) || new Date(Math.max(...rows.map(r=>r.startDate.getTime())));
+      if (end < start) { noData2.style.display='block'; noData2.textContent='End Date must be on or after Start Date.'; return; }
+      const data = computeRequestsPerDay(rows, start, end);
+      if (!data.days || data.days.length===0) { noData2.style.display='block'; return; }
+      noData2.style.display='none';
+  const rect = chartContainer2.getBoundingClientRect(); const width = Math.max(600, rect.width || 800); const height = 320; svg2.setAttribute('viewBox', `0 0 ${width} ${height}`);
+  // give extra right margin so labels for stat lines can be placed
+  const margin = { left:50, right:100, top:20, bottom:40 }; const innerW = width - margin.left - margin.right; const innerH = height - margin.top - margin.bottom;
+      const g = document.createElementNS('http://www.w3.org/2000/svg','g'); g.setAttribute('transform', `translate(${margin.left},${margin.top})`); svg2.appendChild(g);
+      const xMin = data.xDomain[0], xMax = data.xDomain[1];
+      function sx2(ts){ if (xMax===xMin) return innerW/2; return (ts - xMin)/(xMax - xMin) * innerW; }
+      function sy2(v){ return innerH - (v / data.yMax) * innerH; }
+      // highlight weekends with very light vertical bars (Saturday+Sunday)
+      try {
+  const bgG2 = document.createElementNS('http://www.w3.org/2000/svg','g');
+  bgG2.setAttribute('transform', `translate(${margin.left},${margin.top})`);
+  svg2.insertBefore(bgG2, g);
+  let d = new Date(xMin);
+  d = new Date(d.getFullYear(), d.getMonth(), d.getDate());
+  const HALF_DAY2 = 12 * 60 * 60 * 1000; // currently we shifted by +12h earlier
+  const SHIFT_BACK2 = -24 * 60 * 60 * 1000; // move shading back by 24 hours relative to current
+        while (d.getTime() <= xMax) {
+          if (d.getDay() === 6) {
+            // shift start and end by +12 hours so shading begins at noon (approx) instead of midnight
+            let satStart = new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime() + HALF_DAY2;
+            let monStart = addDays(d,2).getTime() + HALF_DAY2;
+            // move back 24 hours as requested
+            satStart += SHIFT_BACK2;
+            monStart += SHIFT_BACK2;
+            const left = sx2(Math.max(satStart, xMin));
+            const right = sx2(Math.min(monStart, xMax));
+            const w = Math.max(0, right - left);
+            if (w > 0) {
+              const r = document.createElementNS('http://www.w3.org/2000/svg','rect');
+              r.setAttribute('x', left);
+              r.setAttribute('y', 0);
+              r.setAttribute('width', w);
+              r.setAttribute('height', innerH);
+              r.setAttribute('fill', 'rgba(15,23,42,0.03)');
+              bgG2.appendChild(r);
+            }
+            d = addDays(d,7);
+          } else {
+            d = addDays(d,1);
+          }
+        }
+      } catch(e) {}
+      // y axis grid and labels
+      const yTicks = Math.min(8, Math.max(2, Math.ceil(data.yMax/1)));
+      for (let i=0;i<=yTicks;i++){ const v=(i/yTicks)*data.yMax; const y=sy2(v); const ty=document.createElementNS('http://www.w3.org/2000/svg','text'); ty.setAttribute('x', -8); ty.setAttribute('y', y+4); ty.setAttribute('font-size','11'); ty.setAttribute('fill','#444'); ty.setAttribute('text-anchor','end'); ty.textContent = Math.round(v); g.appendChild(ty); const grid=document.createElementNS('http://www.w3.org/2000/svg','line'); grid.setAttribute('x1',0); grid.setAttribute('y1',y); grid.setAttribute('x2',innerW); grid.setAttribute('y2',y); grid.setAttribute('stroke','#eaeef6'); g.appendChild(grid); }
+
+      // Y-axis label
+      try {
+        const yLabel = document.createElementNS('http://www.w3.org/2000/svg','text');
+        yLabel.setAttribute('x', -40);
+        yLabel.setAttribute('y', innerH / 2);
+        yLabel.setAttribute('font-size', '12');
+        yLabel.setAttribute('fill', 'var(--muted)');
+        yLabel.setAttribute('text-anchor', 'middle');
+        yLabel.setAttribute('transform', `rotate(-90 ${-40} ${innerH/2})`);
+        yLabel.textContent = 'Number of Requests';
+        g.appendChild(yLabel);
+      } catch(e) {}
+
+      // compute horizontal stats (percentiles + mean) based on the visible filtered counts
+  const countsArr = data.counts.map(c => c.count).slice();
+      function percentile(arr, p){ if (!arr || arr.length===0) return null; const a = arr.slice().sort((x,y)=>x-y); if (a.length===1) return a[0]; const idx = (p/100)*(a.length-1); const lo = Math.floor(idx), hi = Math.ceil(idx); if (lo===hi) return a[lo]; const w = idx - lo; return a[lo]*(1-w) + a[hi]*w; }
+      const stats2 = { p95: percentile(countsArr,95), p85: percentile(countsArr,85), p50: percentile(countsArr,50), p15: percentile(countsArr,15), mean: countsArr.length ? (countsArr.reduce((s,v)=>s+v,0)/countsArr.length) : null };
+      // compute CI / MoE for daily counts mean
+      let ciCounts = null;
+      if (countsArr.length > 0) {
+        const sd = sampleStd(countsArr);
+        const n = countsArr.length;
+        const se = sd / Math.sqrt(n);
+        ciCounts = { n, sd, se, moe90: 1.645 * se, moe95: 1.96 * se };
+      }
+      // show CI info in the requests card
+      try { if (ciInfo2) { if (ciCounts) { ciInfo2.innerHTML = `Mean (daily): ${formatNum(stats2.mean)} &nbsp; ± MoE (90%): ${formatNum(ciCounts.moe90)} &nbsp; ± MoE (95%): ${formatNum(ciCounts.moe95)} (n=${ciCounts.n})`; } else { ciInfo2.textContent = ''; } } } catch(e) {}
+
+      // helper for safe label placement (avoid collisions)
+      function computeSafeLabelY_local(desiredY, existingYs, minSep, topBound, bottomBound) {
+        existingYs = (existingYs || []).slice();
+        function safeAt(y){ for (let i=0;i<existingYs.length;i++){ if (Math.abs(y-existingYs[i]) < minSep) return false; } return true; }
+        if (safeAt(desiredY) && desiredY >= topBound && desiredY <= bottomBound) return desiredY;
+        const maxRadius = Math.max(40, Math.round((bottomBound-topBound)/2));
+        for (let d=1; d<=maxRadius; d++){ const up = desiredY - d; if (up >= topBound && safeAt(up)) return up; const down = desiredY + d; if (down <= bottomBound && safeAt(down)) return down; }
+        let y = Math.max(topBound, Math.min(bottomBound, desiredY));
+        for (let i=0;i<existingYs.length;i++){ if (Math.abs(y-existingYs[i]) < minSep) { y = existingYs[i] + minSep; } }
+        return Math.max(topBound, Math.min(bottomBound, y));
+      }
+
+      // draw horizontal stat line with label on the right (avoid collisions)
+      const existingLabelYs2 = [];
+      function drawH2(val, color, dash, label){ if (val===null || val===undefined) return; const y = sy2(val); const l = document.createElementNS('http://www.w3.org/2000/svg','line'); l.setAttribute('x1',0); l.setAttribute('y1',y); l.setAttribute('x2',innerW); l.setAttribute('y2',y); l.setAttribute('stroke',color); if (dash) l.setAttribute('stroke-dasharray','4 4'); g.appendChild(l); try { const desiredY = Math.max(6, Math.min(innerH-6, y)); const safeY = computeSafeLabelY_local(desiredY, existingLabelYs2, 14, 6, innerH-6); existingLabelYs2.push(safeY); const t = document.createElementNS('http://www.w3.org/2000/svg','text'); t.setAttribute('x', innerW + 8); t.setAttribute('y', Math.round(safeY)+4); t.setAttribute('font-size','11'); t.setAttribute('fill',color); t.setAttribute('text-anchor','start'); t.textContent = label; g.appendChild(t); } catch(e){} }
+      if (toggles.p95) drawH2(stats2.p95, '#999', true, 'P95'); if (toggles.p85) drawH2(stats2.p85, '#999', true, 'P85'); if (toggles.p50) drawH2(stats2.p50, '#999', true, 'P50'); if (toggles.p15) drawH2(stats2.p15, '#999', true, 'P15'); if (toggles.mean) drawH2(stats2.mean, '#e3120b', false, 'Mean');
+      // x axis ticks (every ~max 10 ticks)
+      const days = data.days; const step = Math.max(1, Math.ceil(days.length/10));
+      for (let i=0;i<days.length;i+=step){ const x = sx2(days[i].getTime()); const tx=document.createElementNS('http://www.w3.org/2000/svg','text'); tx.setAttribute('x', x); tx.setAttribute('y', innerH+16); tx.setAttribute('font-size','11'); tx.setAttribute('fill','#444'); tx.setAttribute('text-anchor','middle'); tx.textContent = formatDateKey(days[i]); g.appendChild(tx); }
+      // X-axis label
+      try {
+        const xLabel = document.createElementNS('http://www.w3.org/2000/svg','text');
+        xLabel.setAttribute('x', innerW / 2);
+        xLabel.setAttribute('y', innerH + 36);
+        xLabel.setAttribute('font-size', '12');
+        xLabel.setAttribute('fill', 'var(--muted)');
+        xLabel.setAttribute('text-anchor', 'middle');
+        xLabel.textContent = 'Submit Date';
+        g.appendChild(xLabel);
+      } catch(e) {}
+      // bars
+      const barW = Math.max(2, innerW / Math.max(1, days.length) * 0.85);
+      // unified tooltip content function for a given day index
+      const showDayTooltip = (idx) => {
+        const cnt = data.counts[idx] ? data.counts[idx].count : 0;
+        const v7 = data.ma7 && data.ma7[idx] != null ? formatNum(data.ma7[idx]) : 'N/A';
+        const v28 = data.ma28 && data.ma28[idx] != null ? formatNum(data.ma28[idx]) : 'N/A';
+        const dayStr = data.days && data.days[idx] ? formatDateKey(data.days[idx]) : 'N/A';
+        barTooltip.textContent = `Date: ${dayStr}\nNo. submitted: ${cnt}\n7 day moving avg: ${v7}\n28 day moving avg: ${v28}`;
+        barTooltip.style.display = 'block';
+      };
+      for (let i=0;i<days.length;i++){
+        const d = data.counts[i];
+        const x = sx2(d.ts);
+        const h = innerH - sy2(d.count);
+        const r = document.createElementNS('http://www.w3.org/2000/svg','rect');
+        if (d.count>0) {
+          r.setAttribute('x', x - barW/2);
+          r.setAttribute('y', sy2(d.count));
+          r.setAttribute('width', Math.max(1, barW));
+          r.setAttribute('height', Math.max(0, h));
+          r.setAttribute('fill','rgba(37,99,235,0.18)');
+          r.style.cursor='pointer';
+        } else {
+          r.setAttribute('x', x - barW/2);
+          r.setAttribute('y', innerH - 1);
+          r.setAttribute('width', Math.max(1, barW));
+          r.setAttribute('height', 1);
+          r.setAttribute('fill','rgba(37,99,235,0.06)');
+          r.style.cursor='default';
+        }
+        g.appendChild(r);
+        // attach hover handlers
+        (function(idx, rect){
+          rect.addEventListener('mouseenter', ()=>{ showDayTooltip(idx); });
+          rect.addEventListener('mousemove', (ev)=>{ const rc = chartContainer2.getBoundingClientRect(); let left = ev.clientX - rc.left + 8; const ttW = barTooltip.offsetWidth || 60; if (left + ttW > rc.width) left = ev.clientX - rc.left - ttW - 8; if (left < 4) left = 4; barTooltip.style.left = Math.round(left)+'px'; barTooltip.style.top = Math.round(ev.clientY - rc.top + 8)+'px'; });
+          rect.addEventListener('mouseleave', ()=>{ barTooltip.style.display='none'; });
+        })(i, r);
+      }
+      // lines for MA
+  function drawMA2(key, arr, color) { if (!toggles[key]) return; const pts = data.days.map((d,idx)=>`${sx2(d.getTime())},${sy2(arr[idx])}`); const p=document.createElementNS('http://www.w3.org/2000/svg','polyline'); p.setAttribute('points', pts.join(' ')); p.setAttribute('fill','none'); p.setAttribute('stroke', color); p.setAttribute('stroke-width','1.5'); g.appendChild(p);
+        // add invisible hover band for tooltips
+  for (let i=0;i<data.days.length;i++){ const cx = sx2(data.days[i].getTime()); const hit = document.createElementNS('http://www.w3.org/2000/svg','rect'); hit.setAttribute('x', cx - Math.max(6, barW/2)); hit.setAttribute('y', 0); hit.setAttribute('width', Math.max(12, barW)); hit.setAttribute('height', innerH); hit.setAttribute('fill','transparent'); hit.style.cursor='crosshair'; hit.addEventListener('mouseenter', ()=>{ showDayTooltip(i); }); hit.addEventListener('mousemove', (ev)=>{ const rc = chartContainer2.getBoundingClientRect(); let left = ev.clientX - rc.left + 8; const ttW = barTooltip.offsetWidth || 60; if (left + ttW > rc.width) left = ev.clientX - rc.left - ttW - 8; if (left < 4) left = 4; barTooltip.style.left = Math.round(left)+'px'; barTooltip.style.top = Math.round(ev.clientY - rc.top + 8)+'px'; }); hit.addEventListener('mouseleave', ()=>{ barTooltip.style.display='none'; }); g.appendChild(hit); }
+        // label the MA near the last non-null point with dynamic offset to avoid collisions (like the other chart)
+        try {
+          const lastIdx = (() => { for (let i = arr.length - 1; i >= 0; i--) if (arr[i] != null) return i; return -1; })();
+          if (lastIdx >= 0) {
+            const lastX = sx2(data.days[lastIdx].getTime());
+            const lastY = sy2(arr[lastIdx]);
+            const desiredY = Math.max(6, Math.min(innerH - 6, lastY - 4));
+            const minSep = 14;
+            const safeY = computeSafeLabelY_local(desiredY, existingLabelYs2, minSep, 6, innerH - 6);
+            existingLabelYs2.push(safeY);
+            const lbl = document.createElementNS('http://www.w3.org/2000/svg','text');
+            const lx = Math.min(lastX + 6, innerW - 30);
+            lbl.setAttribute('x', lx);
+            lbl.setAttribute('y', Math.round(safeY));
+            lbl.setAttribute('font-size', '11');
+            lbl.setAttribute('fill', color);
+            lbl.setAttribute('text-anchor', 'start');
+            lbl.textContent = key === 'ma7' ? '7-day MA' : '28-day MA';
+            g.appendChild(lbl);
+          }
+        } catch (e) {
+          // ignore label placement errors
+        }
+      }
+  if (toggles.ma7) drawMA2('ma7', data.ma7, 'var(--accent)'); if (toggles.ma28) drawMA2('ma28', data.ma28, 'var(--accent-2)');
+    }
+
+    // wire events
+    inputCStart.addEventListener('change', renderRequestsChart);
+    inputCEnd.addEventListener('change', renderRequestsChart);
+
+    // initial placeholder
+    renderRequestsChart();
+    // --- Resolved per day card (third chart) ---
+    const card3 = document.createElement('div'); card3.className='card'; card3.style.marginTop='18px';
+    // insert after chartCard (Time to Resolve)
+    if (chartCard && chartCard.nextSibling) root.insertBefore(card3, chartCard.nextSibling); else root.appendChild(card3);
+    const h3 = document.createElement('h1'); h3.textContent = 'Number of Requests Resolved Per Day'; card3.appendChild(h3);
+
+    // filters note: this chart uses the resolved-date filters (inputStart/inputEnd)
+    const resolvedLegendControls = document.createElement('div'); resolvedLegendControls.style.marginTop='8px'; resolvedLegendControls.style.display='flex'; resolvedLegendControls.style.gap='12px'; resolvedLegendControls.style.alignItems='center';
+    // reuse makeSmallToggle by creating small toggles that are kept in sync via toggleInputsMap
+    resolvedLegendControls.appendChild(makeSmallToggle('p95','P95'));
+    resolvedLegendControls.appendChild(makeSmallToggle('p85','P85'));
+    resolvedLegendControls.appendChild(makeSmallToggle('p50','P50'));
+    resolvedLegendControls.appendChild(makeSmallToggle('p15','P15'));
+    resolvedLegendControls.appendChild(makeSmallToggle('mean','Mean'));
+    resolvedLegendControls.appendChild(makeSmallToggle('ma7','7-day MA'));
+    resolvedLegendControls.appendChild(makeSmallToggle('ma28','28-day MA'));
+    card3.appendChild(resolvedLegendControls);
+
+    const legend3 = document.createElement('div'); legend3.style.marginTop='8px'; legend3.style.display='flex'; legend3.style.gap='12px'; legend3.style.alignItems='center';
+    legend3.appendChild(makeLegend('rgba(37,99,235,0.18)','Daily resolved count'));
+    legend3.appendChild(makeLegend('var(--accent)','7-day MA'));
+    legend3.appendChild(makeLegend('var(--accent-2)','28-day MA'));
+    card3.appendChild(legend3);
+
+    const chartContainer3 = document.createElement('div'); chartContainer3.className='chart-container'; chartContainer3.style.marginTop='10px'; card3.appendChild(chartContainer3);
+    chartContainer3.style.position='relative';
+    const svg3 = document.createElementNS('http://www.w3.org/2000/svg','svg'); svg3.setAttribute('width','100%'); svg3.setAttribute('height','100%'); chartContainer3.appendChild(svg3);
+    const noData3 = document.createElement('div'); noData3.className='no-data-message'; noData3.textContent='No resolved requests in selected date range'; noData3.style.display='none'; chartContainer3.appendChild(noData3);
+    const barTooltip3 = document.createElement('div'); barTooltip3.className='point-tooltip'; barTooltip3.style.display='none'; chartContainer3.appendChild(barTooltip3);
+
+    function computeResolvedPerDay(allRows, start, end) {
+      if (!allRows) return { days: [], counts: [], ma7: [], ma28: [], xDomain:[0,1], yMax:1 };
+      const map = new Map(); allRows.forEach(r=>{ const k = formatDateKey(r.resolvedDate); map.set(k, (map.get(k)||0)+1); });
+      const days = buildDateRange(start, end);
+      const counts = days.map(d=> ({date:d, ts: d.getTime(), count: map.get(formatDateKey(d)) || 0}) );
+      const ma7 = []; const ma28 = [];
+      for (let i=0;i<counts.length;i++){
+        const start7 = Math.max(0, i-6); let sum7=0; for (let j=start7;j<=i;j++) sum7 += counts[j].count; ma7.push(sum7/(i-start7+1));
+        const start28 = Math.max(0, i-27); let sum28=0; for (let j=start28;j<=i;j++) sum28 += counts[j].count; ma28.push(sum28/(i-start28+1));
+      }
+      const yMax = Math.max(1, ...counts.map(c=>c.count));
+      return { days, counts, ma7, ma28, xDomain: [days[0] ? days[0].getTime() : 0, days.length? days[days.length-1].getTime() : 1], yMax };
+    }
+
+    function renderResolvedChart() {
+      while (svg3.firstChild) svg3.removeChild(svg3.firstChild);
+      if (!rows || rows.length===0) { noData3.style.display='block'; return; } noData3.style.display='none';
+      const start = parseDateYMD(inputStart.value) || new Date(Math.min(...rows.map(r=>r.resolvedDate.getTime())));
+      const end = parseDateYMD(inputEnd.value) || new Date(Math.max(...rows.map(r=>r.resolvedDate.getTime())));
+      if (end < start) { noData3.style.display='block'; noData3.textContent='End Date must be on or after Start Date.'; return; }
+      const data = computeResolvedPerDay(rows, start, end);
+      if (!data.days || data.days.length===0) { noData3.style.display='block'; return; }
+      noData3.style.display='none';
+      const rect = chartContainer3.getBoundingClientRect(); const width = Math.max(600, rect.width || 800); const height = 320; svg3.setAttribute('viewBox', `0 0 ${width} ${height}`);
+      const margin = { left:50, right:100, top:20, bottom:40 }; const innerW = width - margin.left - margin.right; const innerH = height - margin.top - margin.bottom;
+      const g = document.createElementNS('http://www.w3.org/2000/svg','g'); g.setAttribute('transform', `translate(${margin.left},${margin.top})`); svg3.appendChild(g);
+      const xMin = data.xDomain[0], xMax = data.xDomain[1];
+      function sx3(ts){ if (xMax===xMin) return innerW/2; return (ts - xMin)/(xMax - xMin) * innerW; }
+      function sy3(v){ return innerH - (v / data.yMax) * innerH; }
+
+      // background weekend shading, reuse logic from other charts (shift by HALF_DAY2 and SHIFT_BACK2 if present)
+      try {
+        const bgG3 = document.createElementNS('http://www.w3.org/2000/svg','g');
+        bgG3.setAttribute('transform', `translate(${margin.left},${margin.top})`);
+        svg3.insertBefore(bgG3, g);
+        let d = new Date(xMin);
+        d = new Date(d.getFullYear(), d.getMonth(), d.getDate());
+        const HALF_DAY3 = 12 * 60 * 60 * 1000;
+        const SHIFT_BACK3 = -24 * 60 * 60 * 1000;
+        while (d.getTime() <= xMax) {
+          if (d.getDay() === 6) {
+            let satStart = new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime() + HALF_DAY3;
+            let monStart = addDays(d,2).getTime() + HALF_DAY3;
+            satStart += SHIFT_BACK3; monStart += SHIFT_BACK3;
+            const left = sx3(Math.max(satStart, xMin));
+            const right = sx3(Math.min(monStart, xMax));
+            const w = Math.max(0, right - left);
+            if (w > 0) {
+              const r = document.createElementNS('http://www.w3.org/2000/svg','rect');
+              r.setAttribute('x', left); r.setAttribute('y', 0); r.setAttribute('width', w); r.setAttribute('height', innerH); r.setAttribute('fill', 'rgba(15,23,42,0.03)'); bgG3.appendChild(r);
+            }
+            d = addDays(d,7);
+          } else { d = addDays(d,1); }
+        }
+      } catch(e) {}
+
+      // y axis grid and labels
+      const yTicks = Math.min(8, Math.max(2, Math.ceil(data.yMax/1)));
+      for (let i=0;i<=yTicks;i++){ const v=(i/yTicks)*data.yMax; const y=sy3(v); const ty=document.createElementNS('http://www.w3.org/2000/svg','text'); ty.setAttribute('x', -8); ty.setAttribute('y', y+4); ty.setAttribute('font-size','11'); ty.setAttribute('fill','#444'); ty.setAttribute('text-anchor','end'); ty.textContent = Math.round(v); g.appendChild(ty); const grid=document.createElementNS('http://www.w3.org/2000/svg','line'); grid.setAttribute('x1',0); grid.setAttribute('y1',y); grid.setAttribute('x2',innerW); grid.setAttribute('y2',y); grid.setAttribute('stroke','#eaeef6'); g.appendChild(grid); }
+
+      // compute horizontal stats (percentiles + mean)
+      const countsArr = data.counts.map(c => c.count).slice();
+      function percentile3(arr, p){ if (!arr || arr.length===0) return null; const a = arr.slice().sort((x,y)=>x-y); if (a.length===1) return a[0]; const idx = (p/100)*(a.length-1); const lo = Math.floor(idx), hi = Math.ceil(idx); if (lo===hi) return a[lo]; const w = idx - lo; return a[lo]*(1-w) + a[hi]*w; }
+      const stats3 = { p95: percentile3(countsArr,95), p85: percentile3(countsArr,85), p50: percentile3(countsArr,50), p15: percentile3(countsArr,15), mean: countsArr.length ? (countsArr.reduce((s,v)=>s+v,0)/countsArr.length) : null };
+      let ciCounts3 = null; if (countsArr.length > 0) { const sd = sampleStd(countsArr); const n = countsArr.length; const se = sd / Math.sqrt(n); ciCounts3 = { n, sd, se, moe90: 1.645 * se, moe95: 1.96 * se }; }
+      // show CI info (reuse ciInfo2 pattern) by adding a small note under the legend
+      try { const info3 = document.createElement('div'); info3.style.marginTop='6px'; info3.style.fontSize='12px'; info3.style.color='var(--muted)'; if (ciCounts3) info3.textContent = `Mean (daily resolved): ${formatNum(stats3.mean)} ± MoE (90%): ${formatNum(ciCounts3.moe90)} ± MoE (95%): ${formatNum(ciCounts3.moe95)} (n=${ciCounts3.n})`; card3.appendChild(info3); } catch(e) {}
+
+      // draw horizontal stat lines (reuse drawH2 style)
+      const existingLabelYs3 = [];
+      function drawH3(val, color, dash, label){ if (val===null || val===undefined) return; const y = sy3(val); const l = document.createElementNS('http://www.w3.org/2000/svg','line'); l.setAttribute('x1',0); l.setAttribute('y1',y); l.setAttribute('x2',innerW); l.setAttribute('y2',y); l.setAttribute('stroke',color); if (dash) l.setAttribute('stroke-dasharray','4 4'); g.appendChild(l); try { const desiredY = Math.max(6, Math.min(innerH-6, y)); const safeY = computeSafeLabelY_local(desiredY, existingLabelYs3, 14, 6, innerH-6); existingLabelYs3.push(safeY); const t = document.createElementNS('http://www.w3.org/2000/svg','text'); t.setAttribute('x', innerW + 8); t.setAttribute('y', Math.round(safeY)+4); t.setAttribute('font-size','11'); t.setAttribute('fill',color); t.setAttribute('text-anchor','start'); t.textContent = label; g.appendChild(t); } catch(e){} }
+      if (toggles.p95) drawH3(stats3.p95, '#999', true, 'P95'); if (toggles.p85) drawH3(stats3.p85, '#999', true, 'P85'); if (toggles.p50) drawH3(stats3.p50, '#999', true, 'P50'); if (toggles.p15) drawH3(stats3.p15, '#999', true, 'P15'); if (toggles.mean) drawH3(stats3.mean, '#e3120b', false, 'Mean');
+
+      // x axis ticks and label
+      const days = data.days; const step = Math.max(1, Math.ceil(days.length/10));
+      for (let i=0;i<days.length;i+=step){ const x = sx3(days[i].getTime()); const tx=document.createElementNS('http://www.w3.org/2000/svg','text'); tx.setAttribute('x', x); tx.setAttribute('y', innerH+16); tx.setAttribute('font-size','11'); tx.setAttribute('fill','#444'); tx.setAttribute('text-anchor','middle'); tx.textContent = formatDateKey(days[i]); g.appendChild(tx); }
+      try { const xLabel = document.createElementNS('http://www.w3.org/2000/svg','text'); xLabel.setAttribute('x', innerW / 2); xLabel.setAttribute('y', innerH + 36); xLabel.setAttribute('font-size', '12'); xLabel.setAttribute('fill', 'var(--muted)'); xLabel.setAttribute('text-anchor', 'middle'); xLabel.textContent = 'Resolved Date'; g.appendChild(xLabel); } catch(e) {}
+
+      // bars
+      const barW = Math.max(2, innerW / Math.max(1, days.length) * 0.85);
+      const showDayTooltip3 = (idx) => { const cnt = data.counts[idx] ? data.counts[idx].count : 0; const v7 = data.ma7 && data.ma7[idx] != null ? formatNum(data.ma7[idx]) : 'N/A'; const v28 = data.ma28 && data.ma28[idx] != null ? formatNum(data.ma28[idx]) : 'N/A'; const dayStr = data.days && data.days[idx] ? formatDateKey(data.days[idx]) : 'N/A'; barTooltip3.textContent = `Date: ${dayStr}\nResolved: ${cnt}\n7 day moving avg: ${v7}\n28 day moving avg: ${v28}`; barTooltip3.style.display = 'block'; };
+      for (let i=0;i<days.length;i++){
+        const d = data.counts[i];
+        const x = sx3(d.ts);
+        const h = innerH - sy3(d.count);
+        const r = document.createElementNS('http://www.w3.org/2000/svg','rect');
+        if (d.count>0) {
+          r.setAttribute('x', x - barW/2); r.setAttribute('y', sy3(d.count)); r.setAttribute('width', Math.max(1, barW)); r.setAttribute('height', Math.max(0, h)); r.setAttribute('fill','rgba(37,99,235,0.18)'); r.style.cursor='pointer';
+        } else {
+          r.setAttribute('x', x - barW/2); r.setAttribute('y', innerH - 1); r.setAttribute('width', Math.max(1, barW)); r.setAttribute('height', 1); r.setAttribute('fill','rgba(37,99,235,0.06)'); r.style.cursor='default';
+        }
+        g.appendChild(r);
+        (function(idx, rect){ rect.addEventListener('mouseenter', ()=>{ showDayTooltip3(idx); }); rect.addEventListener('mousemove', (ev)=>{ const rc = chartContainer3.getBoundingClientRect(); let left = ev.clientX - rc.left + 8; const ttW = barTooltip3.offsetWidth || 60; if (left + ttW > rc.width) left = ev.clientX - rc.left - ttW - 8; if (left < 4) left = 4; barTooltip3.style.left = Math.round(left)+'px'; barTooltip3.style.top = Math.round(ev.clientY - rc.top + 8)+'px'; }); rect.addEventListener('mouseleave', ()=>{ barTooltip3.style.display='none'; }); })(i, r);
+      }
+
+      // MA lines
+      function drawMA3(key, arr, color) { if (!toggles[key]) return; const pts = data.days.map((d,idx)=>`${sx3(d.getTime())},${sy3(arr[idx])}`); const p=document.createElementNS('http://www.w3.org/2000/svg','polyline'); p.setAttribute('points', pts.join(' ')); p.setAttribute('fill','none'); p.setAttribute('stroke', color); p.setAttribute('stroke-width','1.5'); g.appendChild(p);
+        for (let i=0;i<data.days.length;i++){ const cx = sx3(data.days[i].getTime()); const hit = document.createElementNS('http://www.w3.org/2000/svg','rect'); hit.setAttribute('x', cx - Math.max(6, barW/2)); hit.setAttribute('y', 0); hit.setAttribute('width', Math.max(12, barW)); hit.setAttribute('height', innerH); hit.setAttribute('fill','transparent'); hit.style.cursor='crosshair'; hit.addEventListener('mouseenter', ()=>{ showDayTooltip3(i); }); hit.addEventListener('mousemove', (ev)=>{ const rc = chartContainer3.getBoundingClientRect(); let left = ev.clientX - rc.left + 8; const ttW = barTooltip3.offsetWidth || 60; if (left + ttW > rc.width) left = ev.clientX - rc.left - ttW - 8; if (left < 4) left = 4; barTooltip3.style.left = Math.round(left)+'px'; barTooltip3.style.top = Math.round(ev.clientY - rc.top + 8)+'px'; }); hit.addEventListener('mouseleave', ()=>{ barTooltip3.style.display='none'; }); g.appendChild(hit); }
+        try { const lastIdx = (() => { for (let i = arr.length - 1; i >= 0; i--) if (arr[i] != null) return i; return -1; })(); if (lastIdx >= 0) { const lastX = sx3(data.days[lastIdx].getTime()); const lastY = sy3(arr[lastIdx]); const desiredY = Math.max(6, Math.min(innerH - 6, lastY - 4)); const minSep = 14; const safeY = computeSafeLabelY_local(desiredY, existingLabelYs3, minSep, 6, innerH - 6); existingLabelYs3.push(safeY); const lbl = document.createElementNS('http://www.w3.org/2000/svg','text'); const lx = Math.min(lastX + 6, innerW - 30); lbl.setAttribute('x', lx); lbl.setAttribute('y', Math.round(safeY)); lbl.setAttribute('font-size', '11'); lbl.setAttribute('fill', color); lbl.setAttribute('text-anchor', 'start'); lbl.textContent = key === 'ma7' ? '7-day MA' : '28-day MA'; g.appendChild(lbl); } } catch (e) {}
+      }
+      if (toggles.ma7) drawMA3('ma7', data.ma7, 'var(--accent)'); if (toggles.ma28) drawMA3('ma28', data.ma28, 'var(--accent-2)');
+    }
+
+    // wire resolved filters to render this chart
+    inputStart.addEventListener('change', renderResolvedChart);
+    inputEnd.addEventListener('change', renderResolvedChart);
+
+    // initial placeholder
+    renderResolvedChart();
+    });
+  </script>
+</body>
+</html>
